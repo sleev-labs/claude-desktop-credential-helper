@@ -8,6 +8,7 @@
 
 mod cli;
 mod credentials;
+mod refresh;
 mod store;
 
 use std::collections::BTreeMap;
@@ -38,6 +39,7 @@ enum Failure {
         error: credentials::ParseError,
     },
     Expired,
+    Refresh(refresh::RefreshError),
 }
 
 impl fmt::Display for Failure {
@@ -54,22 +56,80 @@ impl fmt::Display for Failure {
             }
             Self::Expired => write!(
                 f,
-                "the stored Claude Code token has expired; run `claude` once to refresh it"
+                "the stored Claude Code token has expired and carries no refresh token; \
+                 log in again with the `claude` CLI"
+            ),
+            Self::Refresh(error) => write!(
+                f,
+                "could not refresh the stored Claude Code token: {error}; \
+                 log in again with the `claude` CLI"
             ),
         }
     }
 }
 
-fn obtain(now_ms: i64) -> Result<credentials::OauthCredentials, Failure> {
+struct Outcome {
+    access_token: String,
+    warning: Option<String>,
+}
+
+fn obtain(now_ms: i64) -> Result<Outcome, Failure> {
     let payload = store::read().map_err(Failure::Store)?;
     let creds = credentials::parse(&payload.json).map_err(|error| Failure::Parse {
+        location: payload.source.clone(),
+        error,
+    })?;
+    if !creds.is_expired(now_ms) {
+        return Ok(Outcome {
+            access_token: creds.access_token,
+            warning: None,
+        });
+    }
+
+    let Some(refresh_token) = creds.refresh_token else {
+        return Err(Failure::Expired);
+    };
+    let refreshed = match refresh::refresh(&refresh_token, now_ms) {
+        Ok(refreshed) => refreshed,
+        // A concurrent `claude` run may have rotated the pair already, which
+        // both invalidates our grant and leaves a usable token behind.
+        Err(error) => {
+            return match reread(now_ms) {
+                Some(access_token) => Ok(Outcome {
+                    access_token,
+                    warning: None,
+                }),
+                None => Err(Failure::Refresh(error)),
+            };
+        }
+    };
+
+    let document = credentials::patch(
+        &payload.json,
+        &refreshed.access_token,
+        &refreshed.refresh_token,
+        refreshed.expires_at,
+    )
+    .map_err(|error| Failure::Parse {
         location: payload.source,
         error,
     })?;
-    if creds.is_expired(now_ms) {
-        return Err(Failure::Expired);
-    }
-    Ok(creds)
+    // A token we cannot persist still works until it expires, so the run
+    // succeeds and only warns.
+    let warning = store::write(&document)
+        .err()
+        .map(|error| format!("the refreshed token could not be saved: {error}"));
+
+    Ok(Outcome {
+        access_token: refreshed.access_token,
+        warning,
+    })
+}
+
+fn reread(now_ms: i64) -> Option<String> {
+    let payload = store::read().ok()?;
+    let creds = credentials::parse(&payload.json).ok()?;
+    (!creds.is_expired(now_ms)).then_some(creds.access_token)
 }
 
 fn render_output(token: &str, headers: &BTreeMap<String, String>) -> String {
@@ -83,14 +143,19 @@ fn now_ms() -> i64 {
 }
 
 fn run(args: &cli::Args) -> ExitCode {
+    // The helper contract: silent contexts must produce no output but the
+    // credential itself.
+    let interactive = HelperContext::from_env() == HelperContext::Interactive;
     match obtain(now_ms()) {
-        Ok(creds) => {
-            println!("{}", render_output(&creds.access_token, &args.headers));
+        Ok(outcome) => {
+            if let (true, Some(warning)) = (interactive, outcome.warning) {
+                eprintln!("claude-desktop-cred: {warning}");
+            }
+            println!("{}", render_output(&outcome.access_token, &args.headers));
             ExitCode::SUCCESS
         }
         Err(failure) => {
-            // The helper contract: silent contexts must fail fast with no output.
-            if HelperContext::from_env() == HelperContext::Interactive {
+            if interactive {
                 eprintln!("claude-desktop-cred: {failure}");
             }
             ExitCode::FAILURE
