@@ -1,67 +1,33 @@
-# claude-desktop-credential-helper
+# CLAUDE.md
 
-A single Rust binary, `claude-desktop-cred`, that prints the local Claude Code
-OAuth token in Claude Desktop's `inferenceCredentialHelper` format.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## The contract
+## Commands
 
-Claude Desktop runs the configured executable with no arguments and reads
-stdout.
+- Build: `cargo build` (release: `cargo build --release`)
+- All tests: `cargo test`
+- One test: `cargo test <name>`; e2e suite only: `cargo test --test refresh`
+- Lint/format: `cargo clippy` and `cargo fmt` (toolchain pinned to 1.94.0 in rust-toolchain.toml, which also declares musl targets for CI cross-builds)
 
-- Exit 0 means stdout holds the credential: either a bare token, or
-  `{"token": "...", "headers": {...}}`. We always print the JSON form so
-  `--header` values can ride along. Everything printed to stdout on exit 0 is
-  treated as the credential — never write anything else there.
-- Any non-zero exit is a failure; stdout is ignored and stderr is diagnostics.
-- `CLAUDE_HELPER_CONTEXT` says who is waiting: `interactive` and `setup-test`
-  mean a person will read stderr; `mid-session-refresh`, `scheduled-task` and
-  `background` must stay silent, never prompt, and finish fast — Desktop kills
-  a mid-session refresh after 20 seconds.
-- Output is cached for `inferenceCredentialHelperTtlSec`, so every run must
-  return a credential valid for at least that long.
+## What this is
 
-## Credential store
+A single small binary, `claude-desktop-cred`, used as Claude Desktop's `inferenceCredentialHelper`: it prints the Claude Code CLI's stored OAuth token as `{"token": "...", "headers": {}}` on stdout with exit 0. Any failure exits non-zero with stdout untouched. Only dependencies are serde/serde_json — HTTP and keychain access deliberately shell out to `curl` and `security(1)` instead of linking libraries.
 
-Written by the `claude` CLI; we read and (on refresh) write it back.
+## Architecture
 
-- macOS: Keychain generic password, service `Claude Code-credentials`.
-- Linux and Windows: `<CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json`.
-- Shape: `{"claudeAiOauth": {"accessToken", "refreshToken", "expiresAt", …}}`,
-  where `expiresAt` is epoch milliseconds.
+Flow in `src/main.rs::obtain`: read store → parse → if expired, refresh → patch + persist. Two deliberate subtleties:
 
-Refreshing posts a `refresh_token` grant to Anthropic's OAuth token endpoint
-with Claude Code's public client id, then patches the token fields back into
-the stored document, leaving every other key alone.
+- If the refresh grant is rejected, the store is re-read before failing — a concurrent `claude` run may have rotated the token pair (invalidating our grant but leaving a fresh token behind).
+- A refreshed token that cannot be persisted is still printed; that failure is a warning, not an error.
 
-## Rules
+Modules:
 
-- Keep the dependency tree tiny (serde and serde_json today). The value of
-  this tool is that a reader can audit it in one sitting; shell out to
-  `curl`(1) and `security`(1) rather than pulling in an HTTP or keychain
-  stack.
-- No telemetry, no logging of the token, no network calls beyond the token
-  endpoint.
-- Never put a secret in argv — other processes can read it. Request bodies go
-  over stdin.
-- Stay vendor-neutral: gateway-specific values arrive through `--header`, not
-  in the code.
-- Comment only what is genuinely unintuitive.
+- `store.rs` — platform credential storage behind `read()`/`write()`. macOS: Keychain service `"Claude Code-credentials"` via `security`. Elsewhere: `$CLAUDE_CONFIG_DIR/.credentials.json` (fallback `~/.claude/.credentials.json`), written atomically via temp file + rename, mode 0600.
+- `credentials.rs` — parses the store's `claudeAiOauth` section. Expiry uses a 300s margin matching the recommended `inferenceCredentialHelperTtlSec`, so a cached token stays valid for its whole cache lifetime. `patch()` rewrites only the token fields, preserving every other key the `claude` CLI owns.
+- `refresh.rs` — OAuth refresh grant via `curl` subprocess (body over stdin, never argv; 15s timeout because Desktop kills the helper at 20s). Endpoint overridable with `CLAUDE_DESKTOP_CRED_TOKEN_URL` for tests.
 
-## Layout
+## Conventions
 
-- `src/main.rs` — orchestration, failure classification, exit codes
-  (0 credential, 1 failure, 2 usage).
-- `src/cli.rs` — argument parsing.
-- `src/credentials.rs` — store document model, expiry, and the patch applied
-  after a refresh.
-- `src/store.rs` — platform read and write (Keychain on macOS, file
-  elsewhere).
-- `src/refresh.rs` — the OAuth refresh grant.
-  `CLAUDE_DESKTOP_CRED_TOKEN_URL` overrides the endpoint for tests.
-- `tests/refresh.rs` — end-to-end run against a local token endpoint.
-
-## Quality gate
-
-```sh
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
-```
+- stdout is contract-only; diagnostics go to stderr, and only when interactive — `CLAUDE_HELPER_CONTEXT` values `mid-session-refresh`, `scheduled-task`, `background` must stay silent (see `interactive()` in main.rs).
+- Secrets never go on argv (visible via `ps`); pass over stdin. The one unavoidable exception (`security add-generic-password -w`) is commented in store.rs.
+- `tests/refresh.rs` is the end-to-end suite: it spins up a local TCP token endpoint and runs the real binary against a temp store.
