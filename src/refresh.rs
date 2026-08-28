@@ -6,14 +6,9 @@ use serde::Deserialize;
 /// Claude Code's public OAuth client id; the refresh grant is bound to it.
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Anthropic moved token exchange from `console` to `platform`; older installs
-/// still answer on the former, so try both before giving up.
-const ENDPOINTS: [&str; 2] = [
-    "https://platform.claude.com/v1/oauth/token",
-    "https://console.anthropic.com/v1/oauth/token",
-];
+const ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 
-/// Overrides `ENDPOINTS`, so tests can point the grant at a local server.
+/// Overrides `ENDPOINT`, so tests can point the grant at a local server.
 const ENDPOINT_ENV: &str = "CLAUDE_DESKTOP_CRED_TOKEN_URL";
 
 /// Claude Desktop kills a `mid-session-refresh` helper after 20s.
@@ -70,26 +65,14 @@ pub fn refresh(refresh_token: &str, now_ms: i64) -> Result<Refreshed, RefreshErr
     })
     .to_string();
 
-    let mut last = None;
-    for endpoint in endpoints() {
-        match post(&endpoint, &request) {
-            Ok(response) if response.status == "404" => {
-                last = Some(RefreshError::Rejected {
-                    status: response.status,
-                    body: response.body,
-                });
-            }
-            Ok(response) => return interpret(&response, refresh_token, now_ms),
-            Err(error) => last = Some(error),
-        }
-    }
-    Err(last.unwrap_or_else(|| RefreshError::Transport("no token endpoint configured".to_owned())))
+    let response = post(&endpoint(), &request)?;
+    interpret(&response, refresh_token, now_ms)
 }
 
-fn endpoints() -> Vec<String> {
+fn endpoint() -> String {
     match std::env::var(ENDPOINT_ENV) {
-        Ok(url) if !url.is_empty() => vec![url],
-        _ => ENDPOINTS.map(str::to_owned).to_vec(),
+        Ok(url) if !url.is_empty() => url,
+        _ => ENDPOINT.to_owned(),
     }
 }
 

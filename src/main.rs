@@ -6,30 +6,21 @@
 //! non-zero with stdout untouched; guidance goes to stderr only when a user
 //! is present (`CLAUDE_HELPER_CONTEXT`).
 
-mod cli;
 mod credentials;
 mod refresh;
 mod store;
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HelperContext {
-    Interactive,
-    Silent,
-}
-
-impl HelperContext {
-    fn from_env() -> Self {
-        match std::env::var("CLAUDE_HELPER_CONTEXT").as_deref() {
-            Ok("mid-session-refresh" | "scheduled-task" | "background") => Self::Silent,
-            // `interactive`, `setup-test`, unset, or unknown future values.
-            _ => Self::Interactive,
-        }
-    }
+/// Whether stderr will be read. Claude Desktop names the contexts that must
+/// stay silent; any other value, or none, means diagnostics are wanted.
+fn interactive() -> bool {
+    !matches!(
+        std::env::var("CLAUDE_HELPER_CONTEXT").as_deref(),
+        Ok("mid-session-refresh" | "scheduled-task" | "background")
+    )
 }
 
 enum Failure {
@@ -132,8 +123,8 @@ fn reread(now_ms: i64) -> Option<String> {
     (!creds.is_expired(now_ms)).then_some(creds.access_token)
 }
 
-fn render_output(token: &str, headers: &BTreeMap<String, String>) -> String {
-    serde_json::json!({ "token": token, "headers": headers }).to_string()
+fn render_output(token: &str) -> String {
+    serde_json::json!({ "token": token, "headers": {} }).to_string()
 }
 
 fn now_ms() -> i64 {
@@ -142,20 +133,19 @@ fn now_ms() -> i64 {
         .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
-fn run(args: &cli::Args) -> ExitCode {
-    // The helper contract: silent contexts must produce no output but the
-    // credential itself.
-    let interactive = HelperContext::from_env() == HelperContext::Interactive;
+fn run() -> ExitCode {
     match obtain(now_ms()) {
         Ok(outcome) => {
-            if let (true, Some(warning)) = (interactive, outcome.warning) {
+            if let Some(warning) = outcome.warning
+                && interactive()
+            {
                 eprintln!("claude-desktop-cred: {warning}");
             }
-            println!("{}", render_output(&outcome.access_token, &args.headers));
+            println!("{}", render_output(&outcome.access_token));
             ExitCode::SUCCESS
         }
         Err(failure) => {
-            if interactive {
+            if interactive() {
                 eprintln!("claude-desktop-cred: {failure}");
             }
             ExitCode::FAILURE
@@ -163,19 +153,26 @@ fn run(args: &cli::Args) -> ExitCode {
     }
 }
 
+const USAGE: &str = "\
+Usage: claude-desktop-cred [--version] [--help]
+
+Prints the Claude Code OAuth token in Claude Desktop's
+inferenceCredentialHelper format. Claude Desktop runs it with no arguments;
+routing headers belong in Desktop's own inferenceCustomHeaders.";
+
 fn main() -> ExitCode {
-    match cli::parse(std::env::args().skip(1)) {
-        Ok(cli::Cli::Run(args)) => run(&args),
-        Ok(cli::Cli::Version) => {
+    match std::env::args().nth(1).as_deref() {
+        None => run(),
+        Some("--version") => {
             println!("claude-desktop-cred {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(cli::Cli::Help) => {
-            println!("{}", cli::USAGE);
+        Some("-h" | "--help") => {
+            println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            eprintln!("claude-desktop-cred: {message}\n\n{}", cli::USAGE);
+        Some(other) => {
+            eprintln!("claude-desktop-cred: unknown argument '{other}'\n\n{USAGE}");
             ExitCode::from(2)
         }
     }
@@ -187,19 +184,11 @@ mod tests {
 
     #[test]
     fn renders_contract_json() {
-        let mut headers = BTreeMap::new();
-        headers.insert("sleev-provider".to_owned(), "anthropic".to_owned());
-        assert_eq!(
-            render_output("tok", &headers),
-            r#"{"headers":{"sleev-provider":"anthropic"},"token":"tok"}"#
-        );
+        assert_eq!(render_output("tok"), r#"{"headers":{},"token":"tok"}"#);
     }
 
     #[test]
-    fn renders_empty_headers_as_object() {
-        assert_eq!(
-            render_output("tok", &BTreeMap::new()),
-            r#"{"headers":{},"token":"tok"}"#
-        );
+    fn escapes_the_token() {
+        assert_eq!(render_output("a\"b"), r#"{"headers":{},"token":"a\"b"}"#);
     }
 }

@@ -3,7 +3,7 @@ use serde::Deserialize;
 /// Claude Desktop caches helper output for `inferenceCredentialHelperTtlSec`
 /// (we recommend 300); refusing tokens that expire within the same window
 /// keeps a cached token valid for its whole cache lifetime.
-pub const EXPIRY_MARGIN_MS: i64 = 300_000;
+const EXPIRY_MARGIN_MS: i64 = 300_000;
 
 #[derive(Debug, Deserialize)]
 struct Document {
