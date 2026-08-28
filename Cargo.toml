@@ -1,0 +1,16 @@
+[package]
+name = "claude-desktop-cred"
+version = "0.1.0"
+authors = ["Sleev (https://sleev.ai)"]
+edition = "2024"
+description = "Credential helper for Claude Desktop's third-party inference (gateway) mode: prints the local Claude Code OAuth token in the inferenceCredentialHelper format."
+repository = "https://github.com/sleev-labs/claude-desktop-credential-helper"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = true

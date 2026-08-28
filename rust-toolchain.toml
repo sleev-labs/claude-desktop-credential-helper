@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+# Cross-compilation targets for the release Linux legs; declared here so the
+# pinned toolchain auto-installs the musl std in CI.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
