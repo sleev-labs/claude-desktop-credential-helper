@@ -70,8 +70,17 @@ fn store_dir(name: &str) -> PathBuf {
 }
 
 fn run(directory: &Path, endpoint: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_claude-desktop-cred"))
-        .env("CLAUDE_CONFIG_DIR", directory)
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claude-desktop-cred"));
+    // The real store: `$CLAUDE_CONFIG_DIR/.credentials.json`.
+    command.env("CLAUDE_CONFIG_DIR", directory);
+    // macOS keeps credentials in the Keychain, which cannot be seeded here,
+    // so only there the binary is pointed at the same file instead.
+    #[cfg(target_os = "macos")]
+    command.env(
+        "CLAUDE_DESKTOP_CRED_STORE_FILE",
+        directory.join(".credentials.json"),
+    );
+    command
         .env("CLAUDE_DESKTOP_CRED_TOKEN_URL", endpoint)
         .env("CLAUDE_HELPER_CONTEXT", "mid-session-refresh")
         .output()

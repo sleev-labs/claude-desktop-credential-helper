@@ -1,0 +1,197 @@
+name: Release
+
+# Builds claude-desktop-cred for every platform sleev supports and publishes
+# the archives plus a release manifest to the sleev updates bucket:
+#
+#   claude-desktop-cred/<version>/manifest.json      (immutable)
+#   claude-desktop-cred/<version>/<archives>         (immutable)
+#   claude-desktop-cred/<channel>.json               (mutable pointer, max-age=60)
+#
+# Order: prepare (tag/version check) -> test (lint + test suite on every OS)
+# -> build (6 targets) -> publish. Each stage gates the next, so a bad tag or
+# a failing test never spends build minutes.
+#
+# A tag push (v*) publishes; workflow_dispatch runs the checks and builds
+# only, as a dry run. Publishing authenticates to Google Cloud with Workload Identity
+# Federation (no stored keys) and only ever runs from a tag ref, so branch
+# pushes and fork PRs can never reach the bucket.
+#
+# Required repository configuration for publishing:
+#   vars.SLEEVE_UPDATES_BUCKET            e.g. sleeve-releases
+#   vars.GCP_WORKLOAD_IDENTITY_PROVIDER   projects/<n>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+#   vars.GCP_SERVICE_ACCOUNT              <sa>@<project>.iam.gserviceaccount.com
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  BINARY: claude-desktop-cred
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Resolve version and channel
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails fast on a tag that does not match Cargo.toml, before any build
+      # minutes are spent. On workflow_dispatch the version is informational.
+      - name: Resolve version and channel
+        id: meta
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "${tag}" != "${crate}" ]; then
+              echo "Tag v${tag} does not match Cargo.toml version ${crate}" >&2
+              exit 1
+            fi
+          fi
+          case "${crate}" in
+            *-*) channel=beta ;;
+            *) channel=stable ;;
+          esac
+          echo "version=${crate}" >> "${GITHUB_OUTPUT}"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+
+  test:
+    name: Test
+    needs: prepare
+    uses: ./.github/workflows/tests.yml
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: [prepare, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - platform: darwin-x64
+            runner: macos-15
+            target: x86_64-apple-darwin
+          - platform: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - platform: win32-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - platform: win32-arm64
+            runner: windows-2025
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl linker
+        if: startsWith(matrix.platform, 'linux-')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install pinned toolchain and target
+        run: |
+          rustup show active-toolchain
+          rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Archive (tar.gz)
+        if: ${{ !startsWith(matrix.platform, 'win32-') }}
+        run: |
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/${BINARY}" LICENSE "${staging}/"
+          tar -C "${staging}" -czf "${BINARY}-${{ matrix.platform }}.tar.gz" "${BINARY}" LICENSE
+
+      - name: Archive (zip)
+        if: startsWith(matrix.platform, 'win32-')
+        shell: pwsh
+        run: |
+          $staging = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath()) -Name ([System.Guid]::NewGuid())
+          Copy-Item "target/${{ matrix.target }}/release/$env:BINARY.exe" $staging
+          Copy-Item LICENSE $staging
+          Compress-Archive -Path "$staging/*" -DestinationPath "$env:BINARY-${{ matrix.platform }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.platform }}
+          path: ${{ env.BINARY }}-${{ matrix.platform }}.*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to updates bucket
+    needs: [prepare, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # WIF token exchange and build provenance attestation.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: release
+          merge-multiple: true
+
+      - name: Build release manifest
+        run: |
+          node scripts/build-release-manifest.mjs \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --channel "${{ needs.prepare.outputs.channel }}" \
+            --commit "${GITHUB_SHA}" \
+            --base-url "https://storage.googleapis.com/${{ vars.SLEEVE_UPDATES_BUCKET }}/claude-desktop-cred/${{ needs.prepare.outputs.version }}" \
+            --release-dir release \
+            --output release/manifest.json
+
+      # Links each published archive to this public build; verifiable with
+      # `gh attestation verify <archive> --repo sleev-labs/claude-desktop-credential-helper`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/*.zip
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Publish immutable versioned artifacts
+        run: |
+          dest="gs://${{ vars.SLEEVE_UPDATES_BUCKET }}/claude-desktop-cred/${{ needs.prepare.outputs.version }}"
+          if gsutil -q stat "${dest}/manifest.json"; then
+            echo "Refusing to overwrite already-published version at ${dest}" >&2
+            exit 1
+          fi
+          gsutil -h "Cache-Control:public, max-age=31536000, immutable" \
+            cp release/*.tar.gz release/*.zip release/manifest.json "${dest}/"
+
+      - name: Publish channel manifest
+        run: |
+          gsutil -h "Cache-Control:public, max-age=60" \
+            cp release/manifest.json \
+            "gs://${{ vars.SLEEVE_UPDATES_BUCKET }}/claude-desktop-cred/${{ needs.prepare.outputs.channel }}.json"

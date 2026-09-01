@@ -1,4 +1,6 @@
 use std::fmt;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub struct Payload {
@@ -27,12 +29,44 @@ impl fmt::Display for StoreError {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn read() -> Result<Payload, StoreError> {
     platform::read()
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn write(json: &str) -> Result<(), StoreError> {
     platform::write(json)
+}
+
+/// The macOS store is the Keychain, which the e2e tests cannot seed on a CI
+/// runner. This test seam swaps it for a plain file at the given path so the
+/// rest of the binary runs unchanged; Linux and Windows need no seam because
+/// their real store is already a file under `CLAUDE_CONFIG_DIR`.
+#[cfg(target_os = "macos")]
+const STORE_FILE_ENV: &str = "CLAUDE_DESKTOP_CRED_STORE_FILE";
+
+#[cfg(target_os = "macos")]
+fn override_path() -> Option<PathBuf> {
+    std::env::var_os(STORE_FILE_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+pub fn read() -> Result<Payload, StoreError> {
+    match override_path() {
+        Some(path) => file::read(&path),
+        None => platform::read(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn write(json: &str) -> Result<(), StoreError> {
+    match override_path() {
+        Some(path) => file::write(&path, json),
+        None => platform::write(json),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -136,19 +170,16 @@ fn parse_account(attributes: &str) -> Option<String> {
     Some(account.to_owned())
 }
 
-#[cfg(not(target_os = "macos"))]
-mod platform {
-    use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
+/// Plain-file credential store, `.credentials.json` as written by the
+/// `claude` CLI on Linux and Windows.
+mod file {
+    use std::path::Path;
 
     use super::{Payload, StoreError};
 
-    const FILE_NAME: &str = ".credentials.json";
-
-    pub fn read() -> Result<Payload, StoreError> {
-        let path = store_path()?;
+    pub fn read(path: &Path) -> Result<Payload, StoreError> {
         let location = path.display().to_string();
-        match std::fs::read_to_string(&path) {
+        match std::fs::read_to_string(path) {
             Ok(json) => Ok(Payload {
                 source: location,
                 json,
@@ -163,9 +194,8 @@ mod platform {
         }
     }
 
-    pub fn write(json: &str) -> Result<(), StoreError> {
-        let path = store_path()?;
-        write_file(&path, json).map_err(|cause| StoreError::Unwritable {
+    pub fn write(path: &Path, json: &str) -> Result<(), StoreError> {
+        write_file(path, json).map_err(|cause| StoreError::Unwritable {
             location: path.display().to_string(),
             cause,
         })
@@ -177,7 +207,11 @@ mod platform {
         use std::io::Write;
 
         let directory = path.parent().ok_or("the store has no parent directory")?;
-        let temporary = directory.join(format!("{FILE_NAME}.{}.tmp", std::process::id()));
+        let name = path
+            .file_name()
+            .ok_or("the store has no file name")?
+            .to_string_lossy();
+        let temporary = directory.join(format!("{name}.{}.tmp", std::process::id()));
 
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -199,6 +233,43 @@ mod platform {
             return Err(error.to_string());
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn write_file_replaces_the_store() {
+            let directory = std::env::temp_dir().join(format!("cdc-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join(".credentials.json");
+
+            write_file(&path, "{\"a\":1}").unwrap();
+            write_file(&path, "{\"a\":2}").unwrap();
+
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+            std::fs::remove_dir_all(&directory).unwrap();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod platform {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::{Payload, StoreError, file};
+
+    const FILE_NAME: &str = ".credentials.json";
+
+    pub fn read() -> Result<Payload, StoreError> {
+        file::read(&store_path()?)
+    }
+
+    pub fn write(json: &str) -> Result<(), StoreError> {
+        file::write(&store_path()?, json)
     }
 
     fn store_path() -> Result<PathBuf, StoreError> {
@@ -235,20 +306,6 @@ mod platform {
         #[test]
         fn no_home_and_no_env_is_none() {
             assert_eq!(config_dir(None, None), None);
-        }
-
-        #[test]
-        fn write_file_replaces_the_store() {
-            let directory = std::env::temp_dir().join(format!("cdc-{}", std::process::id()));
-            std::fs::create_dir_all(&directory).unwrap();
-            let path = directory.join(FILE_NAME);
-
-            write_file(&path, "{\"a\":1}").unwrap();
-            write_file(&path, "{\"a\":2}").unwrap();
-
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
-            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
-            std::fs::remove_dir_all(&directory).unwrap();
         }
     }
 }
