@@ -28,7 +28,7 @@ Flow in `src/main.rs::obtain`: read store → parse → if expired, refresh → 
 
 Modules:
 
-- `store.rs` — platform credential storage behind `read()`/`write()`. macOS: Keychain service `"Claude Code-credentials"` via `security`. Elsewhere: `$CLAUDE_CONFIG_DIR/.credentials.json` (fallback `~/.claude/.credentials.json`), written atomically via temp file + rename, mode 0600.
+- `store.rs` — platform credential storage behind `read()`/`write()`. macOS: Keychain service `"Claude Code-credentials"` via `security`. Elsewhere: `$CLAUDE_CONFIG_DIR/.credentials.json` (fallback `~/.claude/.credentials.json`), written atomically via temp file + rename, mode 0600. On macOS only, `CLAUDE_DESKTOP_CRED_STORE_FILE` swaps the Keychain for a file at that path; it exists for the e2e tests, which cannot seed a Keychain, and is compiled out elsewhere.
 - `credentials.rs` — parses the store's `claudeAiOauth` section. Expiry uses a 300s margin matching the recommended `inferenceCredentialHelperTtlSec`, so a cached token stays valid for its whole cache lifetime. `patch()` rewrites only the token fields, preserving every other key the `claude` CLI owns.
 - `refresh.rs` — OAuth refresh grant via `curl` subprocess (body over stdin, never argv; 15s timeout because Desktop kills the helper at 20s). Endpoint overridable with `CLAUDE_DESKTOP_CRED_TOKEN_URL` for tests.
 
